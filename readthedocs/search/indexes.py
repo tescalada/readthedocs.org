@@ -19,7 +19,12 @@ import datetime
 from elasticsearch import Elasticsearch, exceptions
 from elasticsearch.helpers import bulk_index
 
-from django.conf import settings
+# TODO: fix this, it's here to deal with different execution environments
+# django webapp, vs building fixtures for the search docker container
+try:
+    from django.conf import settings
+except ImportError:
+    import settings
 
 
 class Index(object):
@@ -318,14 +323,15 @@ class SectionIndex(Index):
                 '_all': {'enabled': False},
                 # Associate a section with a page.
                 '_parent': {'type': self._parent},
-                # Commenting this out until we need it.
-                # 'suggest': {
-                #     "type": "completion",
-                #     "index_analyzer": "simple",
-                #     "search_analyzer": "simple",
-                #     "payloads": True,
-                # },
                 'properties': {
+                    # FIXME: this moved to support ES 1.2.x
+                    # Commenting this out until we need it.
+                    #'suggest': {
+                    #    "type": "completion",
+                    #    "index_analyzer": "simple",
+                    #    "search_analyzer": "simple",
+                    #    "payloads": True,
+                    #},
                     'id': {'type': 'string', 'index': 'not_analyzed'},
                     'project': {'type': 'string', 'index': 'not_analyzed'},
                     'version': {'type': 'string', 'index': 'not_analyzed'},

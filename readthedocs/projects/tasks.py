@@ -488,6 +488,290 @@ def update_imported_docs(version_pk):
     return ret_dict
 
 
+def setup_environment(version):
+    """
+    Build the virtualenv and install the project into it.
+
+    Always build projects with a virtualenv.
+    """
+    ret_dict = {}
+    project = version.project
+    build_dir = os.path.join(project.venv_path(version=version.slug), 'build')
+    if os.path.exists(build_dir):
+        log.info(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg='Removing existing build dir'))
+        shutil.rmtree(build_dir)
+    if project.use_system_packages:
+        site_packages = '--system-site-packages'
+    else:
+        site_packages = '--no-site-packages'
+
+    # TODO: why is this virtualenv-2.7?
+    # Here the command has been modified to support different
+    # interpreters.
+    ret_dict['venv'] = run(
+        '{cmd} {site_packages} {path}'.format(
+            cmd='virtualenv-2.7 -p {interpreter}'.format(
+                interpreter=project.python_interpreter),
+            site_packages=site_packages,
+            path=project.venv_path(version=version.slug)
+        )
+    )
+    # Other code expects sphinx-build to be installed inside the
+    # virtualenv.  Using the -I option makes sure it gets installed
+    # even if it is already installed system-wide (and
+    # --system-site-packages is used)
+    if project.use_system_packages:
+        ignore_option = '-I'
+    else:
+        ignore_option = ''
+
+    wheeldir = os.path.join(settings.SITE_ROOT, 'deploy', 'wheels')
+    ret_dict['doc_builder'] = run(
+        (
+            '{cmd} install --use-wheel --find-links={wheeldir} -U {ignore_option} '
+            'sphinx==1.2.2 virtualenv==1.10.1 setuptools==1.1 docutils==0.11 readthedocs-sphinx-ext==0.4.4 mkdocs==0.11.1 mock==1.0.1 pillow==2.6.1'
+        ).format(
+            cmd=project.venv_bin(version=version.slug, bin='pip'),
+            ignore_option=ignore_option,
+            wheeldir=wheeldir,
+        )
+    )
+
+    # Handle requirements
+
+    requirements_file_path = project.requirements_file
+    checkout_path = project.checkout_path(version.slug)
+    if not requirements_file_path:
+        docs_dir = builder_loading.get(project.documentation_type)(version).docs_dir()
+        for path in [docs_dir, '']:
+            for req_file in ['pip_requirements.txt', 'requirements.txt']:
+                test_path = os.path.join(checkout_path, path, req_file)
+                print('Testing %s' % test_path)
+                if os.path.exists(test_path):
+                    requirements_file_path = test_path
+                    break
+
+    if requirements_file_path:
+        os.chdir(checkout_path)
+        ret_dict['requirements'] = run(
+            '{cmd} install --exists-action=w -r {requirements}'.format(
+                cmd=project.venv_bin(version=version.slug, bin='pip'),
+                requirements=requirements_file_path))
+
+    # Handle setup.py
+
+    os.chdir(project.checkout_path(version.slug))
+    if os.path.isfile("setup.py"):
+        if getattr(settings, 'USE_PIP_INSTALL', False):
+            ret_dict['install'] = run(
+                '{cmd} install --ignore-installed .'.format(
+                    cmd=project.venv_bin(version=version.slug, bin='pip')))
+        else:
+            ret_dict['install'] = run(
+                '{cmd} setup.py install --force'.format(
+                    cmd=project.venv_bin(version=version.slug,
+                                         bin='python')))
+    else:
+        ret_dict['install'] = (999, "", "No setup.py, skipping install")
+    return ret_dict
+
+
+@task()
+def build_docs(version, force, pdf, man, epub, dash, search, localmedia):
+    """
+    This handles the actual building of the documentation
+    """
+
+    project = version.project
+    results = {}
+
+    before_build.send(sender=version)
+
+    with project.repo_nonblockinglock(version=version,
+                                      max_lock_age=getattr(settings, 'REPO_LOCK_SECONDS', 30)):
+        html_builder = builder_loading.get(project.documentation_type)(version)
+        if force:
+            html_builder.force()
+        html_builder.append_conf()
+        results['html'] = html_builder.build()
+        if results['html'][0] == 0:
+            html_builder.move()
+
+        # Gracefully attempt to move files via task on web workers.
+        try:
+            move_files.delay(
+                version_pk=version.pk,
+                html=True,
+                hostname=socket.gethostname(),
+            )
+        except socket.error:
+            pass
+
+        fake_results = (999, "Project Skipped, Didn't build",
+                        "Project Skipped, Didn't build")
+        if 'mkdocs' in project.documentation_type:
+            if search:
+                try:
+                    search_builder = builder_loading.get('mkdocs_json')(version)
+                    results['search'] = search_builder.build()
+                    if results['search'][0] == 0:
+                        search_builder.move()
+                except:
+                    log.error(LOG_TEMPLATE.format(
+                        project=project.slug, version=version.slug, msg="JSON Build Error"), exc_info=True)
+
+        if 'sphinx' in project.documentation_type:
+            # Search builder. Creates JSON from docs and sends it to the
+            # server.
+            if search:
+                try:
+                    search_builder = builder_loading.get(
+                        'sphinx_search')(version)
+                    results['search'] = search_builder.build()
+                    if results['search'][0] == 0:
+                        # Copy json for safe keeping
+                        search_builder.move()
+                except:
+                    log.error(LOG_TEMPLATE.format(
+                        project=project.slug, version=version.slug, msg="JSON Build Error"), exc_info=True)
+            # Local media builder for singlepage HTML download archive
+            if localmedia:
+                try:
+                    localmedia_builder = builder_loading.get(
+                        'sphinx_singlehtmllocalmedia')(version)
+                    results['localmedia'] = localmedia_builder.build()
+                    if results['localmedia'][0] == 0:
+                        localmedia_builder.move()
+                except:
+                    log.error(LOG_TEMPLATE.format(
+                        project=project.slug, version=version.slug, msg="Local Media HTML Build Error"), exc_info=True)
+
+            # Optional build steps
+            if version.project.slug not in HTML_ONLY and not project.skip:
+                if pdf:
+                    pdf_builder = builder_loading.get('sphinx_pdf')(version)
+                    results['pdf'] = pdf_builder.build()
+                    # Always move pdf results even when there's an error.
+                    # if pdf_results[0] == 0:
+                    pdf_builder.move()
+                else:
+                    results['pdf'] = fake_results
+                if epub:
+                    epub_builder = builder_loading.get('sphinx_epub')(version)
+                    results['epub'] = epub_builder.build()
+                    if results['epub'][0] == 0:
+                        epub_builder.move()
+                else:
+                    results['epub'] = fake_results
+
+    after_build.send(sender=version)
+
+    return results
+
+
+def create_build(build_pk):
+    """
+    Old placeholder for build creation. Now it just gets it from the database.
+    """
+    if build_pk:
+        build = api.build(build_pk).get()
+        for key in ['project', 'version', 'resource_uri', 'absolute_uri']:
+            if key in build:
+                del build[key]
+    else:
+        build = {}
+    return build
+
+
+def record_build(api, record, build, results, state):
+    """
+    Record a build by hitting the API.
+
+    Returns nothing
+    """
+
+    if not record:
+        return None
+
+    setup_steps = ['checkout', 'venv', 'doc_builder', 'requirements', 'install']
+    output_steps = ['html']
+    all_steps = setup_steps + output_steps
+
+    build['state'] = state
+    if 'html' in results:
+        build['success'] = results['html'][0] == 0
+    else:
+        build['success'] = False
+
+    # Set global state
+    # for step in all_steps:
+    #     if results.get(step, False):
+    #         if results.get(step)[0] != 0:
+    #             results['success'] = False
+
+    build['exit_code'] = max([results.get(step, [0])[0] for step in all_steps])
+
+    build['setup'] = build['setup_error'] = ""
+    build['output'] = build['error'] = ""
+
+    for step in setup_steps:
+        if step in results:
+            build['setup'] += "\n\n%s\n-----\n\n" % step
+            build['setup'] += results.get(step)[1]
+            build['setup_error'] += "\n\n%s\n-----\n\n" % step
+            build['setup_error'] += results.get(step)[2]
+
+    for step in output_steps:
+        if step in results:
+            build['output'] += "\n\n%s\n-----\n\n" % step
+            build['output'] += results.get(step)[1]
+            build['error'] += "\n\n%s\n-----\n\n" % step
+            build['error'] += results.get(step)[2]
+
+    # Attempt to stop unicode errors on build reporting
+    for key, val in build.items():
+        if isinstance(val, basestring):
+            build[key] = val.decode('utf-8', 'ignore')
+
+    try:
+        api.build(build['id']).put(build)
+    except Exception:
+        log.error("Unable to post a new build", exc_info=True)
+
+
+def record_pdf(api, record, results, state, version):
+    if not record or 'sphinx' not in version.project.documentation_type:
+        return None
+    try:
+        if 'pdf' in results:
+            pdf_exit = results['pdf'][0]
+            pdf_success = pdf_exit == 0
+            pdf_output = results['pdf'][1]
+            pdf_error = results['pdf'][2]
+        else:
+            pdf_exit = 999
+            pdf_success = False
+            pdf_output = pdf_error = "PDF Failed"
+
+        pdf_output = pdf_output.decode('utf-8', 'ignore')
+        pdf_error = pdf_error.decode('utf-8', 'ignore')
+
+        api.build.post(dict(
+            state=state,
+            project='/api/v1/project/%s/' % version.project.pk,
+            version='/api/v1/version/%s/' % version.pk,
+            success=pdf_success,
+            type='pdf',
+            output=pdf_output,
+            error=pdf_error,
+            exit_code=pdf_exit,
+        ))
+    except Exception:
+        log.error(LOG_TEMPLATE.format(project=version.project.slug,
+                                      version=version.slug, msg="Unable to post a new build"), exc_info=True)
+
+
+###########
 # Web tasks
 @task(queue='web')
 def finish_build(version_pk, build_pk, hostname=None, html=False,
